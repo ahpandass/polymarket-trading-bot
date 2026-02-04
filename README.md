@@ -36,7 +36,7 @@ Order placement is **enabled** in the code; use `trade.toml` and your risk setti
 1. **Requirements:** Node.js ≥ 20.6.0, a Polymarket proxy wallet and the EOA private key that signs for it.
 2. **Clone, install, env, config:**
    ```bash
-   git clone https://github.com/Devs-Dungeon/polymarket-trading-bot
+   git clone https://github.com/dev-protocol/polymarket-trading-bot
    cd polymarket-arbitrage-bot.git
    npm install
    ```
@@ -92,14 +92,14 @@ The bot trades **one binary market at a time**: one **UP** token and one **DOWN*
 
 **Windows (PowerShell):**
 ```powershell
-git clone <your-repo-url>
+git clone https://github.com/dev-protocol/polymarket-trading-bot
 cd polymarket-arbitrage-bot
 npm install
 ```
 
 **Linux / macOS:**
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/dev-protocol/polymarket-trading-bot
 cd polymarket-arbitrage-bot
 npm install
 ```
