@@ -15,6 +15,120 @@ declare module "./index" {
     }
 }
 
+// Helper functions to match CLOB client rounding logic
+function decimalPlaces(num: number): number {
+    if (Number.isInteger(num)) {
+        return 0;
+    }
+    const arr = num.toString().split(".");
+    if (arr.length <= 1) {
+        return 0;
+    }
+    return arr[1]?.length || 0;
+}
+
+function roundDown(num: number, decimals: number): number {
+    if (decimalPlaces(num) <= decimals) {
+        return num;
+    }
+    return Math.floor(num * 10 ** decimals) / 10 ** decimals;
+}
+
+function roundUp(num: number, decimals: number): number {
+    if (decimalPlaces(num) <= decimals) {
+        return num;
+    }
+    return Math.ceil(num * 10 ** decimals) / 10 ** decimals;
+}
+
+function roundNormal(num: number, decimals: number): number {
+    if (decimalPlaces(num) <= decimals) {
+        return num;
+    }
+    return Math.round((num + Number.EPSILON) * 10 ** decimals) / 10 ** decimals;
+}
+
+/**
+ * Calculate amounts for BUY orders that satisfy ALL API constraints:
+ * 1. USD scaled amount (makerAmount) must be divisible by 100 (last 2 digits 0)
+ * 2. Token scaled amount (takerAmount) must be divisible by 10000 (last 4 digits 0)
+ * 3. Both amounts must be positive integers when scaled by 1e6
+ * 4. USD amount must not exceed available funds
+ * 
+ * Uses integer arithmetic to avoid floating point errors.
+ */
+function calculateBuyOrderAmounts(
+    tradeAmount: number,  // in USD
+    price: number         // token price in USD
+): { usdAmount: number; tokenAmount: number; usdScaled: number; tokenScaled: number } | null {
+    const SCALE = 1e6;
+    
+    // Convert to scaled integers
+    const tradeAmountScaled = Math.floor(tradeAmount * SCALE);
+    const priceScaled = Math.round(price * SCALE);
+    
+    // We need to find USD scaled amount U such that:
+    // 1. U ≤ tradeAmountScaled
+    // 2. U % 100 = 0 (USD has max 4 decimal places)
+    // 3. T = U * SCALE / priceScaled is integer
+    // 4. T % 10000 = 0 (token has max 2 decimal places)
+    
+    // Condition 3 & 4: T = U * SCALE / priceScaled is integer and divisible by 10000
+    // This means: (U * SCALE) % (priceScaled * 10000) = 0
+    
+    const divisor = priceScaled * 10000;
+    
+    // Start with maximum possible USD scaled amount that satisfies constraint 2
+    let U = Math.floor(tradeAmountScaled / 100) * 100;
+    
+    // Search downward for a U that satisfies all constraints
+    // We'll try up to 1000 iterations (reducing by 100 each time)
+    for (let i = 0; i < 1000 && U > 0; i++) {
+        // Check if (U * SCALE) is divisible by divisor
+        if ((U * SCALE) % divisor === 0) {
+            // Calculate token scaled amount
+            const T = (U * SCALE) / priceScaled;
+            
+            // Verify T is integer and divisible by 10000
+            if (T % 10000 === 0 && T > 0) {
+                // Convert back to human-readable amounts
+                const usdAmount = U / SCALE;
+                const tokenAmount = T / SCALE;
+                
+                // Additional sanity checks
+                if (usdAmount <= 0 || tokenAmount <= 0 || 
+                    isNaN(usdAmount) || isNaN(tokenAmount) || 
+                    !isFinite(usdAmount) || !isFinite(tokenAmount)) {
+                    continue;
+                }
+                
+                // Check decimal places in string representation
+                const usdStr = usdAmount.toString();
+                const tokenStr = tokenAmount.toString();
+                const usdDecimalPlaces = usdStr.includes('.') ? (usdStr.split('.')[1]?.length || 0) : 0;
+                const tokenDecimalPlaces = tokenStr.includes('.') ? (tokenStr.split('.')[1]?.length || 0) : 0;
+                
+                if (usdDecimalPlaces > 4 || tokenDecimalPlaces > 2) {
+                    continue;
+                }
+                
+                return {
+                    usdAmount,
+                    tokenAmount,
+                    usdScaled: U,
+                    tokenScaled: T
+                };
+            }
+        }
+        
+        // Try next candidate (reduce by 100, which is 0.0001 USD in scaled units)
+        U -= 100;
+    }
+    
+    // No valid amount found
+    return null;
+}
+
 // Function to attach methods to Trade class (called from index.ts)
 export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
     // Method to check token balances and update state
@@ -126,102 +240,48 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             return;
         }
 
-        // For BUY orders:
-        // - maker amount (USD) supports max 4 decimals accuracy
-        // - taker amount (tokens) supports max 2 decimals accuracy
-        // We need to find token amount with max 2 decimals such that USD = token * price has max 4 decimals
-        
-        // Start with maximum token amount we can afford
-        let tokenAmount = tradeAmount / price;
-        
-        // Round token amount to 2 decimal places
-        tokenAmount = parseFloat(tokenAmount.toFixed(2));
-        
-        // Compute corresponding USD amount
-        let usdAmount = tokenAmount * price;
-        
-        // Ensure USD amount doesn't exceed available funds
-        // If it does, reduce token amount by 0.01 (smallest unit) until USD <= tradeAmount
-        while (usdAmount > tradeAmount && tokenAmount > 0) {
-            tokenAmount = parseFloat((tokenAmount - 0.01).toFixed(2));
-            if (tokenAmount <= 0) {
-                console.error("Cannot buy up token: insufficient funds after decimal adjustment");
-                return;
-            }
-            usdAmount = tokenAmount * price;
-        }
-        
-        // Check decimal constraints
-        // USD amount should have <= 4 decimal places
-        const usdStr = usdAmount.toString();
-        const usdDecimalPlaces = usdStr.includes('.') ? (usdStr.split('.')[1]?.length || 0) : 0;
-        if (usdDecimalPlaces > 4) {
-            // Round USD to 4 decimal places and recompute token amount
-            usdAmount = parseFloat(usdAmount.toFixed(4));
-            tokenAmount = usdAmount / price;
-            // Re-round token to 2 decimals
-            tokenAmount = parseFloat(tokenAmount.toFixed(2));
-            // Recompute USD to ensure consistency
-            usdAmount = tokenAmount * price;
-            usdAmount = parseFloat(usdAmount.toFixed(4));
-            
-            // Check again for fund sufficiency
-            if (usdAmount > tradeAmount) {
-                tokenAmount = parseFloat((tokenAmount - 0.01).toFixed(2));
-                if (tokenAmount <= 0) {
-                    console.error("Cannot buy up token: insufficient funds after decimal rounding");
-                    return;
-                }
-                usdAmount = tokenAmount * price;
-                usdAmount = parseFloat(usdAmount.toFixed(4));
-            }
-        }
-        
-        // Final validation
-        if (usdAmount <= 0 || tokenAmount <= 0 || 
-            isNaN(usdAmount) || isNaN(tokenAmount) || 
-            !isFinite(usdAmount) || !isFinite(tokenAmount)) {
-            console.error("Cannot buy up token: invalid amounts after decimal adjustment");
+        // Use the mathematical solution that guarantees ALL API constraints
+        const result = calculateBuyOrderAmounts(tradeAmount, price);
+        if (!result) {
+            console.error("Cannot buy up token: unable to calculate amounts satisfying all API constraints");
             return;
         }
         
-        // Additional check: scaled amounts must satisfy API constraints
-        const SCALE = 1e6;
-        const usdScaled = Math.round(usdAmount * SCALE);
-        const tokenScaled = Math.round(tokenAmount * SCALE);
+        const { usdAmount, tokenAmount, usdScaled, tokenScaled } = result;
         
-        // USD scaled must have last 2 digits zero (6-4=2)
-        // Token scaled must have last 4 digits zero (6-2=4)
-        if (usdScaled % 100 !== 0 || tokenScaled % 10000 !== 0) {
-            console.error("Cannot buy up token: scaled amounts violate decimal constraints", {
-                usdAmount,
-                tokenAmount,
-                usdScaled,
-                tokenScaled,
-                usdScaledLast2: usdScaled % 100,
-                tokenScaledLast4: tokenScaled % 10000
-            });
-            // Try to adjust by reducing token amount further
-            let adjusted = false;
-            let attempts = 0;
-            while (attempts < 100 && (usdScaled % 100 !== 0 || tokenScaled % 10000 !== 0)) {
-                tokenAmount = parseFloat((tokenAmount - 0.01).toFixed(2));
-                if (tokenAmount <= 0) break;
-                usdAmount = tokenAmount * price;
-                usdAmount = parseFloat(usdAmount.toFixed(4));
-                const newUsdScaled = Math.round(usdAmount * SCALE);
-                const newTokenScaled = Math.round(tokenAmount * SCALE);
-                if (newUsdScaled % 100 === 0 && newTokenScaled % 10000 === 0) {
-                    adjusted = true;
-                    break;
-                }
-                attempts++;
-            }
-            
-            if (!adjusted) {
-                console.error("Cannot buy up token: unable to satisfy decimal constraints after adjustments");
-                return;
-            }
+        // Additional validation
+        if (usdAmount <= 0 || tokenAmount <= 0 || 
+            isNaN(usdAmount) || isNaN(tokenAmount) || 
+            !isFinite(usdAmount) || !isFinite(tokenAmount)) {
+            console.error("Cannot buy up token: invalid amounts after mathematical calculation");
+            return;
+        }
+        
+        // Verify constraints explicitly
+        const usdStr = usdAmount.toString();
+        const tokenStr = tokenAmount.toString();
+        const usdDecimalPlaces = usdStr.includes('.') ? (usdStr.split('.')[1]?.length || 0) : 0;
+        const tokenDecimalPlaces = tokenStr.includes('.') ? (tokenStr.split('.')[1]?.length || 0) : 0;
+        
+        if (usdDecimalPlaces > 4) {
+            console.error("Cannot buy up token: USD amount has more than 4 decimal places", { usdAmount, usdDecimalPlaces });
+            return;
+        }
+        
+        if (tokenDecimalPlaces > 2) {
+            console.error("Cannot buy up token: token amount has more than 2 decimal places", { tokenAmount, tokenDecimalPlaces });
+            return;
+        }
+        
+        // Verify scaled amounts satisfy constraints
+        if (usdScaled % 100 !== 0) {
+            console.error("Cannot buy up token: USD scaled amount last 2 digits not zero", { usdAmount, usdScaled, usdScaledLast2: usdScaled % 100 });
+            return;
+        }
+        
+        if (tokenScaled % 10000 !== 0) {
+            console.error("Cannot buy up token: token scaled amount last 4 digits not zero", { tokenAmount, tokenScaled, tokenScaledLast4: tokenScaled % 10000 });
+            return;
         }
 
         console.log("Buying up token", { 
@@ -230,8 +290,10 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             usdAmount: usdAmount,
             tokenAmount: tokenAmount,
             originalUsd: tradeAmount,
-            usdScaled: Math.round(usdAmount * SCALE),
-            tokenScaled: Math.round(tokenAmount * SCALE)
+            usdScaled: usdScaled,
+            tokenScaled: tokenScaled,
+            usdDecimalPlaces,
+            tokenDecimalPlaces
         });
 
         try {
@@ -240,7 +302,6 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             const maxRetries = globalThis.__CONFIG__?.max_retries || 3;
             
             // For BUY orders, amount should be in USD, not token size
-            // Use FAK (Fill and Kill) instead of FOK to allow partial fills
             const order = await retryWithInstantRetry(
                 async () => {
                     const result = await this.authorizedClob.createAndPostMarketOrder({
@@ -275,15 +336,15 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             // Log detailed error info for decimal issues
             if (error?.data?.error?.includes("invalid amounts") || error?.data?.error?.includes("decimals")) {
                 console.error("💡 Decimal constraint error details:", {
-                    usdAmount: usdAmount,
-                    tokenAmount: tokenAmount,
-                    price: price,
-                    usdDecimals: usdAmount.toString().split('.')[1]?.length || 0,
-                    tokenDecimals: tokenAmount.toString().split('.')[1]?.length || 0,
-                    usdScaled: usdScaled,
-                    tokenScaled: Math.round(tokenAmount * SCALE),
+                    usdAmount,
+                    tokenAmount,
+                    price,
+                    usdDecimalPlaces,
+                    tokenDecimalPlaces,
+                    usdScaled,
+                    tokenScaled,
                     usdScaledLast2: usdScaled % 100,
-                    tokenScaledLast4: Math.round(tokenAmount * SCALE) % 10000
+                    tokenScaledLast4: tokenScaled % 10000
                 });
             }
         } finally {
@@ -318,55 +379,35 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             return;
         }
 
+        // SIMPLE SOLUTION: Ensure both amounts satisfy API constraints
         // For BUY orders:
-        // - maker amount (USD) supports max 4 decimals accuracy
-        // - taker amount (tokens) supports max 2 decimals accuracy
-        // We need to find token amount with max 2 decimals such that USD = token * price has max 4 decimals
+        // - USD amount (maker) must have ≤ 4 decimal places
+        // - Token amount (taker) must have ≤ 2 decimal places
+        // - Amounts are scaled by 1e6 in API
         
-        // Start with maximum token amount we can afford
+        // Start with maximum token amount we can afford (tokens = USD / price)
         let tokenAmount = tradeAmount / price;
         
-        // Round token amount to 2 decimal places
-        tokenAmount = parseFloat(tokenAmount.toFixed(2));
+        // Round DOWN token amount to 2 decimal places (max allowed for taker)
+        // Use roundDown to ensure we don't exceed funds
+        tokenAmount = Math.floor(tokenAmount * 100) / 100;
         
-        // Compute corresponding USD amount
+        // Calculate USD amount needed for this token amount
         let usdAmount = tokenAmount * price;
         
-        // Ensure USD amount doesn't exceed available funds
-        // If it does, reduce token amount by 0.01 (smallest unit) until USD <= tradeAmount
-        while (usdAmount > tradeAmount && tokenAmount > 0) {
+        // Round USD amount to 4 decimal places (max allowed for maker)
+        usdAmount = parseFloat(usdAmount.toFixed(4));
+        
+        // Verify we have enough funds (should be true due to rounding down)
+        if (usdAmount > tradeAmount) {
+            // If rounding caused issues, reduce token amount by 0.01
             tokenAmount = parseFloat((tokenAmount - 0.01).toFixed(2));
             if (tokenAmount <= 0) {
                 console.error("Cannot buy down token: insufficient funds after decimal adjustment");
                 return;
             }
             usdAmount = tokenAmount * price;
-        }
-        
-        // Check decimal constraints
-        // USD amount should have <= 4 decimal places
-        const usdStr = usdAmount.toString();
-        const usdDecimalPlaces = usdStr.includes('.') ? (usdStr.split('.')[1]?.length || 0) : 0;
-        if (usdDecimalPlaces > 4) {
-            // Round USD to 4 decimal places and recompute token amount
             usdAmount = parseFloat(usdAmount.toFixed(4));
-            tokenAmount = usdAmount / price;
-            // Re-round token to 2 decimals
-            tokenAmount = parseFloat(tokenAmount.toFixed(2));
-            // Recompute USD to ensure consistency
-            usdAmount = tokenAmount * price;
-            usdAmount = parseFloat(usdAmount.toFixed(4));
-            
-            // Check again for fund sufficiency
-            if (usdAmount > tradeAmount) {
-                tokenAmount = parseFloat((tokenAmount - 0.01).toFixed(2));
-                if (tokenAmount <= 0) {
-                    console.error("Cannot buy down token: insufficient funds after decimal rounding");
-                    return;
-                }
-                usdAmount = tokenAmount * price;
-                usdAmount = parseFloat(usdAmount.toFixed(4));
-            }
         }
         
         // Final validation
@@ -377,43 +418,36 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             return;
         }
         
-        // Additional check: scaled amounts must satisfy API constraints
-        const SCALE = 1e6;
-        const usdScaled = Math.round(usdAmount * SCALE);
-        const tokenScaled = Math.round(tokenAmount * SCALE);
+        // Check decimal constraints explicitly
+        const usdStr = usdAmount.toString();
+        const tokenStr = tokenAmount.toString();
+        const usdDecimalPlaces = usdStr.includes('.') ? (usdStr.split('.')[1]?.length || 0) : 0;
+        const tokenDecimalPlaces = tokenStr.includes('.') ? (tokenStr.split('.')[1]?.length || 0) : 0;
         
-        // USD scaled must have last 2 digits zero (6-4=2)
-        // Token scaled must have last 4 digits zero (6-2=4)
-        if (usdScaled % 100 !== 0 || tokenScaled % 10000 !== 0) {
-            console.error("Cannot buy down token: scaled amounts violate decimal constraints", {
-                usdAmount,
-                tokenAmount,
-                usdScaled,
-                tokenScaled,
-                usdScaledLast2: usdScaled % 100,
-                tokenScaledLast4: tokenScaled % 10000
-            });
-            // Try to adjust by reducing token amount further
-            let adjusted = false;
-            let attempts = 0;
-            while (attempts < 100 && (usdScaled % 100 !== 0 || tokenScaled % 10000 !== 0)) {
-                tokenAmount = parseFloat((tokenAmount - 0.01).toFixed(2));
-                if (tokenAmount <= 0) break;
-                usdAmount = tokenAmount * price;
-                usdAmount = parseFloat(usdAmount.toFixed(4));
-                const newUsdScaled = Math.round(usdAmount * SCALE);
-                const newTokenScaled = Math.round(tokenAmount * SCALE);
-                if (newUsdScaled % 100 === 0 && newTokenScaled % 10000 === 0) {
-                    adjusted = true;
-                    break;
-                }
-                attempts++;
-            }
-            
-            if (!adjusted) {
-                console.error("Cannot buy down token: unable to satisfy decimal constraints after adjustments");
-                return;
-            }
+        if (usdDecimalPlaces > 4) {
+            console.error("Cannot buy down token: USD amount has more than 4 decimal places", { usdAmount, usdDecimalPlaces });
+            return;
+        }
+        
+        if (tokenDecimalPlaces > 2) {
+            console.error("Cannot buy down token: token amount has more than 2 decimal places", { tokenAmount, tokenDecimalPlaces });
+            return;
+        }
+        
+        // Check scaled amounts (1e6)
+        const SCALE = 1e6;
+        const usdScaled = usdAmount * SCALE;
+        const tokenScaled = tokenAmount * SCALE;
+        
+        // Scaled amounts must be integers (or very close due to floating point)
+        if (Math.abs(usdScaled - Math.round(usdScaled)) > 0.0001) {
+            console.error("Cannot buy down token: USD scaled amount is not integer", { usdAmount, usdScaled });
+            return;
+        }
+        
+        if (Math.abs(tokenScaled - Math.round(tokenScaled)) > 0.0001) {
+            console.error("Cannot buy down token: token scaled amount is not integer", { tokenAmount, tokenScaled });
+            return;
         }
 
         console.log("Buying down token", { 
