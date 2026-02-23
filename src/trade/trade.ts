@@ -49,14 +49,14 @@ function roundNormal(num: number, decimals: number): number {
 }
 
 /**
- * Simple, guaranteed algorithm to calculate BUY order amounts.
- * Searches token scaled amounts directly to satisfy constraints.
+ * Calculate BUY order amounts using exact BigInt arithmetic.
+ * Guarantees all API constraints are met exactly.
  */
 function calculateBuyOrderAmounts(
     tradeAmount: number,  // in USD
     price: number         // token price in USD
 ): { usdAmount: number; tokenAmount: number; usdScaled: number; tokenScaled: number } | null {
-    const SCALE = 1e6;
+    const SCALE = 1000000n; // 1e6 as BigInt
     
     console.log("🔍 calculateBuyOrderAmounts input:", { 
         tradeAmount, 
@@ -64,149 +64,139 @@ function calculateBuyOrderAmounts(
         humanReadable: { tradeAmount, price }
     });
     
-    // Calculate maximum token amount we can afford
-    const maxTokenAmount = tradeAmount / price;
+    // Convert to scaled BigInts
+    const tradeAmountScaled = BigInt(Math.floor(tradeAmount * 1e6));
+    const priceScaled = BigInt(Math.round(price * 1e6));
     
-    // Convert to scaled token amount
-    const maxTokenScaled = Math.floor(maxTokenAmount * SCALE);
+    // We need to find tokenScaled (BigInt) such that:
+    // 1. tokenScaled ≤ tradeAmountScaled * SCALE / priceScaled
+    // 2. tokenScaled % 10000n = 0
+    // 3. usdScaled = tokenScaled * priceScaled / SCALE must be integer and % 100n = 0
     
-    // We need to find tokenScaled such that:
-    // 1. tokenScaled ≤ maxTokenScaled
-    // 2. tokenScaled % 10000 = 0 (token constraint: last 4 digits 0 = max 2 decimal places)
-    // 3. usdAmount = tokenAmount * price has usdScaled % 100 = 0 (USD constraint)
+    // Calculate maximum token scaled amount using exact integer arithmetic
+    const maxTokenScaledNumerator = tradeAmountScaled * SCALE;
+    const maxTokenScaled = maxTokenScaledNumerator / priceScaled;
     
     // Start from maximum token scaled amount that satisfies constraint 2
-    let tokenScaled = maxTokenScaled - (maxTokenScaled % 10000);
+    let tokenScaled = maxTokenScaled - (maxTokenScaled % 10000n);
+    
+    // Minimum token amount is 0.01 tokens (10000 in scaled units)
+    const MIN_TOKEN_SCALED = 10000n;
     
     // Search downwards for a valid tokenScaled
-    // Minimum token amount is 0.01 tokens (10000 in scaled units)
-    while (tokenScaled >= 10000) {
-        // Calculate token amount
-        const tokenAmount = tokenScaled / SCALE;
+    while (tokenScaled >= MIN_TOKEN_SCALED) {
+        // Calculate USD scaled amount using exact integer arithmetic
+        // usdScaled = tokenScaled * priceScaled / SCALE
+        const usdScaledNumerator = tokenScaled * priceScaled;
         
-        // Calculate USD amount needed
-        const usdAmount = tokenAmount * price;
-        const usdAmountRounded = parseFloat(usdAmount.toFixed(4));
+        // Check if divisible by SCALE
+        if (usdScaledNumerator % SCALE !== 0n) {
+            tokenScaled -= 10000n;
+            continue;
+        }
+        
+        const usdScaled = usdScaledNumerator / SCALE;
+        
+        // Check USD constraint: usdScaled % 100n must be 0
+        if (usdScaled % 100n !== 0n) {
+            tokenScaled -= 10000n;
+            continue;
+        }
+        
+        // Check token constraint (should be true by construction)
+        if (tokenScaled % 10000n !== 0n) {
+            tokenScaled -= 10000n;
+            continue;
+        }
         
         // Ensure we don't exceed available funds
-        if (usdAmountRounded > tradeAmount) {
-            tokenScaled -= 10000;
+        if (usdScaled > tradeAmountScaled) {
+            tokenScaled -= 10000n;
             continue;
         }
         
-        // Calculate USD scaled amount
-        const usdScaled = Math.round(usdAmountRounded * SCALE);
-        
-        // Check USD constraint: usdScaled % 100 must be 0
-        if (usdScaled % 100 !== 0) {
-            // Try next candidate
-            tokenScaled -= 10000;
-            continue;
-        }
-        
-        // Double-check token constraint (should be true by construction)
-        if (tokenScaled % 10000 !== 0) {
-            tokenScaled -= 10000;
-            continue;
-        }
-        
-        // Calculate final USD amount (ensuring 4 decimal places)
-        const finalUsdAmount = parseFloat((tokenAmount * price).toFixed(4));
-        const finalUsdScaled = Math.round(finalUsdAmount * SCALE);
-        
-        // Verify both constraints one more time
-        if (finalUsdScaled % 100 !== 0 || tokenScaled % 10000 !== 0) {
-            tokenScaled -= 10000;
-            continue;
-        }
-        
-        // Verify amounts are mathematically consistent
-        const expectedTokenFromUsd = finalUsdAmount / price;
-        if (Math.abs(tokenAmount - expectedTokenFromUsd) > 0.0001) {
-            tokenScaled -= 10000;
-            continue;
-        }
+        // Convert back to human-readable amounts
+        const usdAmount = Number(usdScaled) / 1e6;
+        const tokenAmount = Number(tokenScaled) / 1e6;
         
         // Check decimal places in string representation
-        const usdStr = finalUsdAmount.toString();
+        const usdStr = usdAmount.toString();
         const tokenStr = tokenAmount.toString();
         const usdDecimalPlaces = usdStr.includes('.') ? (usdStr.split('.')[1]?.length || 0) : 0;
         const tokenDecimalPlaces = tokenStr.includes('.') ? (tokenStr.split('.')[1]?.length || 0) : 0;
         
         if (usdDecimalPlaces > 4 || tokenDecimalPlaces > 2) {
-            tokenScaled -= 10000;
+            tokenScaled -= 10000n;
             continue;
         }
         
-        console.log("✅ Found valid amounts:", {
-            usdAmount: finalUsdAmount,
+        // Final verification: ensure amounts are mathematically consistent
+        const expectedUsdFromToken = tokenAmount * price;
+        if (Math.abs(usdAmount - expectedUsdFromToken) > 0.00001) {
+            tokenScaled -= 10000n;
+            continue;
+        }
+        
+        console.log("✅ Found valid amounts (BigInt exact arithmetic):", {
+            usdAmount,
             tokenAmount,
-            usdScaled: finalUsdScaled,
-            tokenScaled,
+            usdScaled: Number(usdScaled),
+            tokenScaled: Number(tokenScaled),
             usdDecimalPlaces,
             tokenDecimalPlaces,
-            usdScaledLast2: finalUsdScaled % 100,
-            tokenScaledLast4: tokenScaled % 10000,
-            efficiency: (finalUsdAmount / tradeAmount * 100).toFixed(1) + '%'
+            usdScaledLast2: Number(usdScaled % 100n),
+            tokenScaledLast4: Number(tokenScaled % 10000n),
+            efficiency: (usdAmount / tradeAmount * 100).toFixed(1) + '%',
+            priceCheck: usdAmount / tokenAmount
         });
         
         return {
-            usdAmount: finalUsdAmount,
+            usdAmount,
             tokenAmount,
-            usdScaled: finalUsdScaled,
-            tokenScaled
+            usdScaled: Number(usdScaled),
+            tokenScaled: Number(tokenScaled)
         };
     }
     
-    console.error("❌ No valid amounts found with standard search, trying fallback...");
+    console.error("❌ No valid amounts found with BigInt arithmetic");
     
-    // Fallback strategy: try small fixed token amounts
-    // Start with minimum tradable amount (0.01 tokens)
-    let fallbackTokenScaled = 10000; // 0.01 tokens
+    // Simple fallback for edge cases
+    console.log("🔄 Trying simple fallback...");
     
-    while (fallbackTokenScaled <= maxTokenScaled && fallbackTokenScaled <= 1000000) { // Up to 1.0 tokens
-        const tokenAmount = fallbackTokenScaled / SCALE;
-        const usdAmount = tokenAmount * price;
-        const usdAmountRounded = parseFloat(usdAmount.toFixed(4));
+    // Try minimum tradable amount (0.01 tokens)
+    const MIN_TOKEN_AMOUNT = 0.01;
+    const fallbackTokenAmount = MIN_TOKEN_AMOUNT;
+    const fallbackUsdAmount = fallbackTokenAmount * price;
+    const fallbackUsdAmountRounded = parseFloat(fallbackUsdAmount.toFixed(4));
+    
+    if (fallbackUsdAmountRounded <= tradeAmount && fallbackUsdAmountRounded > 0) {
+        const usdScaled = Math.round(fallbackUsdAmountRounded * 1e6);
+        const tokenScaled = Math.round(fallbackTokenAmount * 1e6);
         
-        // Check if we can afford it
-        if (usdAmountRounded > tradeAmount) {
-            fallbackTokenScaled += 10000;
-            continue;
-        }
-        
-        const usdScaled = Math.round(usdAmountRounded * SCALE);
-        
-        // Check constraints
-        if (usdScaled % 100 === 0 && fallbackTokenScaled % 10000 === 0) {
-            console.log("✅ Found fallback amounts:", {
-                usdAmount: usdAmountRounded,
-                tokenAmount,
+        if (usdScaled % 100 === 0 && tokenScaled % 10000 === 0) {
+            console.log("✅ Found fallback minimum amounts:", {
+                usdAmount: fallbackUsdAmountRounded,
+                tokenAmount: fallbackTokenAmount,
                 usdScaled,
-                tokenScaled: fallbackTokenScaled,
-                usdScaledLast2: usdScaled % 100,
-                tokenScaledLast4: fallbackTokenScaled % 10000
+                tokenScaled
             });
             
             return {
-                usdAmount: usdAmountRounded,
-                tokenAmount,
+                usdAmount: fallbackUsdAmountRounded,
+                tokenAmount: fallbackTokenAmount,
                 usdScaled,
-                tokenScaled: fallbackTokenScaled
+                tokenScaled
             };
         }
-        
-        fallbackTokenScaled += 10000;
     }
     
-    console.error("❌ Fallback also failed");
+    console.error("❌ All algorithms failed");
     console.error("Search parameters:", {
         tradeAmount,
         price,
-        maxTokenScaled,
-        maxTokenHuman: maxTokenScaled / SCALE,
-        minTokenScaled: 10000,
-        minTokenHuman: 0.01
+        tradeAmountScaled: tradeAmountScaled.toString(),
+        priceScaled: priceScaled.toString(),
+        maxTokenScaled: maxTokenScaled.toString()
     });
     
     return null;
@@ -393,9 +383,17 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             
             const maxRetries = globalThis.__CONFIG__?.max_retries || 3;
             
-            // For BUY orders, amount should be in USD, not token size
+        // For BUY orders, amount should be in USD, not token size
             const order = await retryWithInstantRetry(
                 async () => {
+                    console.log("📤 Sending order with amounts:", {
+                        usdAmount,
+                        tokenAmount,
+                        usdScaled,
+                        tokenScaled,
+                        price
+                    });
+                    
                     const result = await this.authorizedClob.createAndPostMarketOrder({
                         tokenID: this.upTokenId,
                         amount: usdAmount, // USD amount to buy
@@ -542,6 +540,16 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             // Use FAK (Fill and Kill) instead of FOK to allow partial fills
             const order = await retryWithInstantRetry(
                 async () => {
+                    console.log("📤 Sending order with amounts:", {
+                        usdAmount,
+                        tokenAmount,
+                        usdScaled,
+                        tokenScaled,
+                        price,
+                        usdAmountString: usdAmount.toString(),
+                        tokenAmountString: tokenAmount.toString()
+                    });
+                    
                     const result = await this.authorizedClob.createAndPostMarketOrder({
                         tokenID: this.downTokenId,
                         amount: usdAmount, // USD amount to buy
