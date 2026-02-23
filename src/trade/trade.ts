@@ -49,8 +49,8 @@ function roundNormal(num: number, decimals: number): number {
 }
 
 /**
- * Calculate amounts for BUY orders that satisfy ALL API constraints.
- * Uses integer arithmetic to guarantee all constraints are met exactly.
+ * Simple, guaranteed algorithm to calculate BUY order amounts.
+ * Searches token scaled amounts directly to satisfy constraints.
  */
 function calculateBuyOrderAmounts(
     tradeAmount: number,  // in USD
@@ -58,75 +58,160 @@ function calculateBuyOrderAmounts(
 ): { usdAmount: number; tokenAmount: number; usdScaled: number; tokenScaled: number } | null {
     const SCALE = 1e6;
     
-    // Convert to scaled integers
-    const maxUsdScaled = Math.floor(tradeAmount * SCALE);
+    console.log("🔍 calculateBuyOrderAmounts input:", { 
+        tradeAmount, 
+        price,
+        humanReadable: { tradeAmount, price }
+    });
     
-    // We need to find USD scaled amount U such that:
-    // 1. U ≤ maxUsdScaled
-    // 2. U % 100 = 0 (USD constraint: last 2 digits 0)
-    // 3. T = round(U / price) is integer and T % 10000 = 0 (token constraint)
+    // Calculate maximum token amount we can afford
+    const maxTokenAmount = tradeAmount / price;
     
-    // Convert price to scaled integer to avoid floating point issues
-    const priceScaled = Math.round(price * SCALE);
+    // Convert to scaled token amount
+    const maxTokenScaled = Math.floor(maxTokenAmount * SCALE);
     
-    // Search downwards for a valid U
-    // Start from the largest USD amount that satisfies constraint 2
-    let U = maxUsdScaled - (maxUsdScaled % 100);
+    // We need to find tokenScaled such that:
+    // 1. tokenScaled ≤ maxTokenScaled
+    // 2. tokenScaled % 10000 = 0 (token constraint: last 4 digits 0 = max 2 decimal places)
+    // 3. usdAmount = tokenAmount * price has usdScaled % 100 = 0 (USD constraint)
     
-    // We'll search a reasonable number of iterations (up to 10000, which is 1 USD in scaled units)
-    for (let i = 0; i < 10000 && U > 0; i++) {
-        // Calculate token scaled amount T = U / price
-        // Using integer arithmetic: T = Math.round(U * SCALE / priceScaled)
-        const T = Math.round(U * SCALE / priceScaled);
+    // Start from maximum token scaled amount that satisfies constraint 2
+    let tokenScaled = maxTokenScaled - (maxTokenScaled % 10000);
+    
+    // Search downwards for a valid tokenScaled
+    // Minimum token amount is 0.01 tokens (10000 in scaled units)
+    while (tokenScaled >= 10000) {
+        // Calculate token amount
+        const tokenAmount = tokenScaled / SCALE;
         
-        // Check token constraint
-        if (T % 10000 !== 0) {
-            U -= 100;
+        // Calculate USD amount needed
+        const usdAmount = tokenAmount * price;
+        const usdAmountRounded = parseFloat(usdAmount.toFixed(4));
+        
+        // Ensure we don't exceed available funds
+        if (usdAmountRounded > tradeAmount) {
+            tokenScaled -= 10000;
             continue;
         }
         
-        // Both amounts must be positive
-        if (U <= 0 || T <= 0) {
-            U -= 100;
+        // Calculate USD scaled amount
+        const usdScaled = Math.round(usdAmountRounded * SCALE);
+        
+        // Check USD constraint: usdScaled % 100 must be 0
+        if (usdScaled % 100 !== 0) {
+            // Try next candidate
+            tokenScaled -= 10000;
             continue;
         }
         
-        // Convert back to human-readable amounts
-        const usdAmount = U / SCALE;
-        const tokenAmount = T / SCALE;
+        // Double-check token constraint (should be true by construction)
+        if (tokenScaled % 10000 !== 0) {
+            tokenScaled -= 10000;
+            continue;
+        }
         
-        // Check decimal places in string representation (sanity check)
-        const usdStr = usdAmount.toString();
+        // Calculate final USD amount (ensuring 4 decimal places)
+        const finalUsdAmount = parseFloat((tokenAmount * price).toFixed(4));
+        const finalUsdScaled = Math.round(finalUsdAmount * SCALE);
+        
+        // Verify both constraints one more time
+        if (finalUsdScaled % 100 !== 0 || tokenScaled % 10000 !== 0) {
+            tokenScaled -= 10000;
+            continue;
+        }
+        
+        // Verify amounts are mathematically consistent
+        const expectedTokenFromUsd = finalUsdAmount / price;
+        if (Math.abs(tokenAmount - expectedTokenFromUsd) > 0.0001) {
+            tokenScaled -= 10000;
+            continue;
+        }
+        
+        // Check decimal places in string representation
+        const usdStr = finalUsdAmount.toString();
         const tokenStr = tokenAmount.toString();
         const usdDecimalPlaces = usdStr.includes('.') ? (usdStr.split('.')[1]?.length || 0) : 0;
         const tokenDecimalPlaces = tokenStr.includes('.') ? (tokenStr.split('.')[1]?.length || 0) : 0;
         
         if (usdDecimalPlaces > 4 || tokenDecimalPlaces > 2) {
-            U -= 100;
+            tokenScaled -= 10000;
             continue;
         }
         
-        // Verify mathematical consistency (usdAmount * price ≈ tokenAmount)
-        // Calculate with high precision
-        const expectedTokenAmount = usdAmount * price;
-        const tolerance = 0.00001; // Very small tolerance
-        if (Math.abs(tokenAmount - expectedTokenAmount) > tolerance) {
-            U -= 100;
-            continue;
-        }
-        
-        // All constraints satisfied!
-        return {
-            usdAmount,
+        console.log("✅ Found valid amounts:", {
+            usdAmount: finalUsdAmount,
             tokenAmount,
-            usdScaled: U,
-            tokenScaled: T
+            usdScaled: finalUsdScaled,
+            tokenScaled,
+            usdDecimalPlaces,
+            tokenDecimalPlaces,
+            usdScaledLast2: finalUsdScaled % 100,
+            tokenScaledLast4: tokenScaled % 10000,
+            efficiency: (finalUsdAmount / tradeAmount * 100).toFixed(1) + '%'
+        });
+        
+        return {
+            usdAmount: finalUsdAmount,
+            tokenAmount,
+            usdScaled: finalUsdScaled,
+            tokenScaled
         };
     }
     
-    // No valid amount found
+    console.error("❌ No valid amounts found with standard search, trying fallback...");
+    
+    // Fallback strategy: try small fixed token amounts
+    // Start with minimum tradable amount (0.01 tokens)
+    let fallbackTokenScaled = 10000; // 0.01 tokens
+    
+    while (fallbackTokenScaled <= maxTokenScaled && fallbackTokenScaled <= 1000000) { // Up to 1.0 tokens
+        const tokenAmount = fallbackTokenScaled / SCALE;
+        const usdAmount = tokenAmount * price;
+        const usdAmountRounded = parseFloat(usdAmount.toFixed(4));
+        
+        // Check if we can afford it
+        if (usdAmountRounded > tradeAmount) {
+            fallbackTokenScaled += 10000;
+            continue;
+        }
+        
+        const usdScaled = Math.round(usdAmountRounded * SCALE);
+        
+        // Check constraints
+        if (usdScaled % 100 === 0 && fallbackTokenScaled % 10000 === 0) {
+            console.log("✅ Found fallback amounts:", {
+                usdAmount: usdAmountRounded,
+                tokenAmount,
+                usdScaled,
+                tokenScaled: fallbackTokenScaled,
+                usdScaledLast2: usdScaled % 100,
+                tokenScaledLast4: fallbackTokenScaled % 10000
+            });
+            
+            return {
+                usdAmount: usdAmountRounded,
+                tokenAmount,
+                usdScaled,
+                tokenScaled: fallbackTokenScaled
+            };
+        }
+        
+        fallbackTokenScaled += 10000;
+    }
+    
+    console.error("❌ Fallback also failed");
+    console.error("Search parameters:", {
+        tradeAmount,
+        price,
+        maxTokenScaled,
+        maxTokenHuman: maxTokenScaled / SCALE,
+        minTokenScaled: 10000,
+        minTokenHuman: 0.01
+    });
+    
     return null;
 }
+
 
 // Function to attach methods to Trade class (called from index.ts)
 export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
