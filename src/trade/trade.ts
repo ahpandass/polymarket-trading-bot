@@ -119,22 +119,120 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             return;
         }
 
-        // Round trade amount to 2 decimal places for buying
-        const roundedTradeAmount = Math.round(tradeAmount * 100) / 100;
-
-        const size = Math.floor(roundedTradeAmount / this.upBuyPrice);
-
-        if (size <= 0 || isNaN(size) || !isFinite(size)) {
-            console.error("Cannot buy up token: insufficient funds or invalid size");
-            return;
-        }
-
         // Ensure price is a valid number
         const price = Number(this.upBuyPrice);
         if (isNaN(price) || !isFinite(price) || price <= 0) {
             console.error("Cannot buy up token: invalid price value");
             return;
         }
+
+        // For BUY orders:
+        // - maker amount (USD) supports max 4 decimals accuracy
+        // - taker amount (tokens) supports max 2 decimals accuracy
+        // We need to find token amount with max 2 decimals such that USD = token * price has max 4 decimals
+        
+        // Start with maximum token amount we can afford
+        let tokenAmount = tradeAmount / price;
+        
+        // Round token amount to 2 decimal places
+        tokenAmount = parseFloat(tokenAmount.toFixed(2));
+        
+        // Compute corresponding USD amount
+        let usdAmount = tokenAmount * price;
+        
+        // Ensure USD amount doesn't exceed available funds
+        // If it does, reduce token amount by 0.01 (smallest unit) until USD <= tradeAmount
+        while (usdAmount > tradeAmount && tokenAmount > 0) {
+            tokenAmount = parseFloat((tokenAmount - 0.01).toFixed(2));
+            if (tokenAmount <= 0) {
+                console.error("Cannot buy up token: insufficient funds after decimal adjustment");
+                return;
+            }
+            usdAmount = tokenAmount * price;
+        }
+        
+        // Check decimal constraints
+        // USD amount should have <= 4 decimal places
+        const usdStr = usdAmount.toString();
+        const usdDecimalPlaces = usdStr.includes('.') ? (usdStr.split('.')[1]?.length || 0) : 0;
+        if (usdDecimalPlaces > 4) {
+            // Round USD to 4 decimal places and recompute token amount
+            usdAmount = parseFloat(usdAmount.toFixed(4));
+            tokenAmount = usdAmount / price;
+            // Re-round token to 2 decimals
+            tokenAmount = parseFloat(tokenAmount.toFixed(2));
+            // Recompute USD to ensure consistency
+            usdAmount = tokenAmount * price;
+            usdAmount = parseFloat(usdAmount.toFixed(4));
+            
+            // Check again for fund sufficiency
+            if (usdAmount > tradeAmount) {
+                tokenAmount = parseFloat((tokenAmount - 0.01).toFixed(2));
+                if (tokenAmount <= 0) {
+                    console.error("Cannot buy up token: insufficient funds after decimal rounding");
+                    return;
+                }
+                usdAmount = tokenAmount * price;
+                usdAmount = parseFloat(usdAmount.toFixed(4));
+            }
+        }
+        
+        // Final validation
+        if (usdAmount <= 0 || tokenAmount <= 0 || 
+            isNaN(usdAmount) || isNaN(tokenAmount) || 
+            !isFinite(usdAmount) || !isFinite(tokenAmount)) {
+            console.error("Cannot buy up token: invalid amounts after decimal adjustment");
+            return;
+        }
+        
+        // Additional check: scaled amounts must satisfy API constraints
+        const SCALE = 1e6;
+        const usdScaled = Math.round(usdAmount * SCALE);
+        const tokenScaled = Math.round(tokenAmount * SCALE);
+        
+        // USD scaled must have last 2 digits zero (6-4=2)
+        // Token scaled must have last 4 digits zero (6-2=4)
+        if (usdScaled % 100 !== 0 || tokenScaled % 10000 !== 0) {
+            console.error("Cannot buy up token: scaled amounts violate decimal constraints", {
+                usdAmount,
+                tokenAmount,
+                usdScaled,
+                tokenScaled,
+                usdScaledLast2: usdScaled % 100,
+                tokenScaledLast4: tokenScaled % 10000
+            });
+            // Try to adjust by reducing token amount further
+            let adjusted = false;
+            let attempts = 0;
+            while (attempts < 100 && (usdScaled % 100 !== 0 || tokenScaled % 10000 !== 0)) {
+                tokenAmount = parseFloat((tokenAmount - 0.01).toFixed(2));
+                if (tokenAmount <= 0) break;
+                usdAmount = tokenAmount * price;
+                usdAmount = parseFloat(usdAmount.toFixed(4));
+                const newUsdScaled = Math.round(usdAmount * SCALE);
+                const newTokenScaled = Math.round(tokenAmount * SCALE);
+                if (newUsdScaled % 100 === 0 && newTokenScaled % 10000 === 0) {
+                    adjusted = true;
+                    break;
+                }
+                attempts++;
+            }
+            
+            if (!adjusted) {
+                console.error("Cannot buy up token: unable to satisfy decimal constraints after adjustments");
+                return;
+            }
+        }
+
+        console.log("Buying up token", { 
+            tokenID: this.upTokenId, 
+            price: price, 
+            usdAmount: usdAmount,
+            tokenAmount: tokenAmount,
+            originalUsd: tradeAmount,
+            usdScaled: Math.round(usdAmount * SCALE),
+            tokenScaled: Math.round(tokenAmount * SCALE)
+        });
 
         try {
             GLOBAL_TX_PROCESS.current = TxProcess.Working;
@@ -147,7 +245,7 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
                 async () => {
                     const result = await this.authorizedClob.createAndPostMarketOrder({
                         tokenID: this.upTokenId,
-                        amount: roundedTradeAmount, // USD amount to buy (rounded to 2 decimals)
+                        amount: usdAmount, // USD amount to buy
                         price: price, // Optional: specify price, otherwise uses market price
                         side: Side.BUY,
                     }, undefined, OrderType.GTC); // GTC stays in book until filled or cancelled
@@ -174,6 +272,20 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             if (error?.status === 401 || error?.data?.error?.includes("Unauthorized")) {
                 console.error("⚠️  API authentication failed. Please check your API_KEY, SECRET_KEY, and PASSPHASE in your .env file.");
             }
+            // Log detailed error info for decimal issues
+            if (error?.data?.error?.includes("invalid amounts") || error?.data?.error?.includes("decimals")) {
+                console.error("💡 Decimal constraint error details:", {
+                    usdAmount: usdAmount,
+                    tokenAmount: tokenAmount,
+                    price: price,
+                    usdDecimals: usdAmount.toString().split('.')[1]?.length || 0,
+                    tokenDecimals: tokenAmount.toString().split('.')[1]?.length || 0,
+                    usdScaled: usdScaled,
+                    tokenScaled: Math.round(tokenAmount * SCALE),
+                    usdScaledLast2: usdScaled % 100,
+                    tokenScaledLast4: Math.round(tokenAmount * SCALE) % 10000
+                });
+            }
         } finally {
             GLOBAL_TX_PROCESS.current = TxProcess.Idle;
         }
@@ -199,16 +311,6 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             return;
         }
 
-        // Round trade amount to 2 decimal places for buying
-        const roundedTradeAmount = Math.round(tradeAmount * 100) / 100;
-
-        const size = Math.floor(roundedTradeAmount / this.downBuyPrice);
-
-        if (size <= 0 || isNaN(size) || !isFinite(size)) {
-            console.error("Cannot buy down token: insufficient funds or invalid size");
-            return;
-        }
-
         // Ensure price is a valid number
         const price = Number(this.downBuyPrice);
         if (isNaN(price) || !isFinite(price) || price <= 0) {
@@ -216,7 +318,114 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             return;
         }
 
-        console.log("buying down token", { tokenID: this.downTokenId, price: price, size });
+        // For BUY orders:
+        // - maker amount (USD) supports max 4 decimals accuracy
+        // - taker amount (tokens) supports max 2 decimals accuracy
+        // We need to find token amount with max 2 decimals such that USD = token * price has max 4 decimals
+        
+        // Start with maximum token amount we can afford
+        let tokenAmount = tradeAmount / price;
+        
+        // Round token amount to 2 decimal places
+        tokenAmount = parseFloat(tokenAmount.toFixed(2));
+        
+        // Compute corresponding USD amount
+        let usdAmount = tokenAmount * price;
+        
+        // Ensure USD amount doesn't exceed available funds
+        // If it does, reduce token amount by 0.01 (smallest unit) until USD <= tradeAmount
+        while (usdAmount > tradeAmount && tokenAmount > 0) {
+            tokenAmount = parseFloat((tokenAmount - 0.01).toFixed(2));
+            if (tokenAmount <= 0) {
+                console.error("Cannot buy down token: insufficient funds after decimal adjustment");
+                return;
+            }
+            usdAmount = tokenAmount * price;
+        }
+        
+        // Check decimal constraints
+        // USD amount should have <= 4 decimal places
+        const usdStr = usdAmount.toString();
+        const usdDecimalPlaces = usdStr.includes('.') ? (usdStr.split('.')[1]?.length || 0) : 0;
+        if (usdDecimalPlaces > 4) {
+            // Round USD to 4 decimal places and recompute token amount
+            usdAmount = parseFloat(usdAmount.toFixed(4));
+            tokenAmount = usdAmount / price;
+            // Re-round token to 2 decimals
+            tokenAmount = parseFloat(tokenAmount.toFixed(2));
+            // Recompute USD to ensure consistency
+            usdAmount = tokenAmount * price;
+            usdAmount = parseFloat(usdAmount.toFixed(4));
+            
+            // Check again for fund sufficiency
+            if (usdAmount > tradeAmount) {
+                tokenAmount = parseFloat((tokenAmount - 0.01).toFixed(2));
+                if (tokenAmount <= 0) {
+                    console.error("Cannot buy down token: insufficient funds after decimal rounding");
+                    return;
+                }
+                usdAmount = tokenAmount * price;
+                usdAmount = parseFloat(usdAmount.toFixed(4));
+            }
+        }
+        
+        // Final validation
+        if (usdAmount <= 0 || tokenAmount <= 0 || 
+            isNaN(usdAmount) || isNaN(tokenAmount) || 
+            !isFinite(usdAmount) || !isFinite(tokenAmount)) {
+            console.error("Cannot buy down token: invalid amounts after decimal adjustment");
+            return;
+        }
+        
+        // Additional check: scaled amounts must satisfy API constraints
+        const SCALE = 1e6;
+        const usdScaled = Math.round(usdAmount * SCALE);
+        const tokenScaled = Math.round(tokenAmount * SCALE);
+        
+        // USD scaled must have last 2 digits zero (6-4=2)
+        // Token scaled must have last 4 digits zero (6-2=4)
+        if (usdScaled % 100 !== 0 || tokenScaled % 10000 !== 0) {
+            console.error("Cannot buy down token: scaled amounts violate decimal constraints", {
+                usdAmount,
+                tokenAmount,
+                usdScaled,
+                tokenScaled,
+                usdScaledLast2: usdScaled % 100,
+                tokenScaledLast4: tokenScaled % 10000
+            });
+            // Try to adjust by reducing token amount further
+            let adjusted = false;
+            let attempts = 0;
+            while (attempts < 100 && (usdScaled % 100 !== 0 || tokenScaled % 10000 !== 0)) {
+                tokenAmount = parseFloat((tokenAmount - 0.01).toFixed(2));
+                if (tokenAmount <= 0) break;
+                usdAmount = tokenAmount * price;
+                usdAmount = parseFloat(usdAmount.toFixed(4));
+                const newUsdScaled = Math.round(usdAmount * SCALE);
+                const newTokenScaled = Math.round(tokenAmount * SCALE);
+                if (newUsdScaled % 100 === 0 && newTokenScaled % 10000 === 0) {
+                    adjusted = true;
+                    break;
+                }
+                attempts++;
+            }
+            
+            if (!adjusted) {
+                console.error("Cannot buy down token: unable to satisfy decimal constraints after adjustments");
+                return;
+            }
+        }
+
+        console.log("Buying down token", { 
+            tokenID: this.downTokenId, 
+            price: price, 
+            usdAmount: usdAmount,
+            tokenAmount: tokenAmount,
+            originalUsd: tradeAmount,
+            usdScaled: Math.round(usdAmount * SCALE),
+            tokenScaled: Math.round(tokenAmount * SCALE)
+        });
+
         try {
             GLOBAL_TX_PROCESS.current = TxProcess.Working;
             
@@ -228,7 +437,7 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
                 async () => {
                     const result = await this.authorizedClob.createAndPostMarketOrder({
                         tokenID: this.downTokenId,
-                        amount: roundedTradeAmount, // USD amount to buy (rounded to 2 decimals)
+                        amount: usdAmount, // USD amount to buy
                         price: price, // Optional: specify price, otherwise uses market price
                         side: Side.BUY,
                     }, undefined, OrderType.GTC); // GTC stays in book until filled or cancelled
@@ -254,6 +463,20 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             console.error("❌ Error buying down token:", error);
             if (error?.status === 401 || error?.data?.error?.includes("Unauthorized")) {
                 console.error("⚠️  API authentication failed. Please check your API_KEY, SECRET_KEY, and PASSPHASE in your .env file.");
+            }
+            // Log detailed error info for decimal issues
+            if (error?.data?.error?.includes("invalid amounts") || error?.data?.error?.includes("decimals")) {
+                console.error("💡 Decimal constraint error details:", {
+                    usdAmount: usdAmount,
+                    tokenAmount: tokenAmount,
+                    price: price,
+                    usdDecimals: usdAmount.toString().split('.')[1]?.length || 0,
+                    tokenDecimals: tokenAmount.toString().split('.')[1]?.length || 0,
+                    usdScaled: Math.round(usdAmount * SCALE),
+                    tokenScaled: Math.round(tokenAmount * SCALE),
+                    usdScaledLast2: Math.round(usdAmount * SCALE) % 100,
+                    tokenScaledLast4: Math.round(tokenAmount * SCALE) % 10000
+                });
             }
         } finally {
             GLOBAL_TX_PROCESS.current = TxProcess.Idle;
