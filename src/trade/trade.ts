@@ -49,13 +49,8 @@ function roundNormal(num: number, decimals: number): number {
 }
 
 /**
- * Calculate amounts for BUY orders that satisfy ALL API constraints:
- * 1. USD scaled amount (makerAmount) must be divisible by 100 (last 2 digits 0)
- * 2. Token scaled amount (takerAmount) must be divisible by 10000 (last 4 digits 0)
- * 3. Both amounts must be positive integers when scaled by 1e6
- * 4. USD amount must not exceed available funds
- * 
- * Uses integer arithmetic to avoid floating point errors.
+ * Calculate amounts for BUY orders that satisfy ALL API constraints.
+ * Uses integer arithmetic to guarantee all constraints are met exactly.
  */
 function calculateBuyOrderAmounts(
     tradeAmount: number,  // in USD
@@ -64,65 +59,69 @@ function calculateBuyOrderAmounts(
     const SCALE = 1e6;
     
     // Convert to scaled integers
-    const tradeAmountScaled = Math.floor(tradeAmount * SCALE);
-    const priceScaled = Math.round(price * SCALE);
+    const maxUsdScaled = Math.floor(tradeAmount * SCALE);
     
     // We need to find USD scaled amount U such that:
-    // 1. U ≤ tradeAmountScaled
-    // 2. U % 100 = 0 (USD has max 4 decimal places)
-    // 3. T = U * SCALE / priceScaled is integer
-    // 4. T % 10000 = 0 (token has max 2 decimal places)
+    // 1. U ≤ maxUsdScaled
+    // 2. U % 100 = 0 (USD constraint: last 2 digits 0)
+    // 3. T = round(U / price) is integer and T % 10000 = 0 (token constraint)
     
-    // Condition 3 & 4: T = U * SCALE / priceScaled is integer and divisible by 10000
-    // This means: (U * SCALE) % (priceScaled * 10000) = 0
+    // Convert price to scaled integer to avoid floating point issues
+    const priceScaled = Math.round(price * SCALE);
     
-    const divisor = priceScaled * 10000;
+    // Search downwards for a valid U
+    // Start from the largest USD amount that satisfies constraint 2
+    let U = maxUsdScaled - (maxUsdScaled % 100);
     
-    // Start with maximum possible USD scaled amount that satisfies constraint 2
-    let U = Math.floor(tradeAmountScaled / 100) * 100;
-    
-    // Search downward for a U that satisfies all constraints
-    // We'll try up to 1000 iterations (reducing by 100 each time)
-    for (let i = 0; i < 1000 && U > 0; i++) {
-        // Check if (U * SCALE) is divisible by divisor
-        if ((U * SCALE) % divisor === 0) {
-            // Calculate token scaled amount
-            const T = (U * SCALE) / priceScaled;
-            
-            // Verify T is integer and divisible by 10000
-            if (T % 10000 === 0 && T > 0) {
-                // Convert back to human-readable amounts
-                const usdAmount = U / SCALE;
-                const tokenAmount = T / SCALE;
-                
-                // Additional sanity checks
-                if (usdAmount <= 0 || tokenAmount <= 0 || 
-                    isNaN(usdAmount) || isNaN(tokenAmount) || 
-                    !isFinite(usdAmount) || !isFinite(tokenAmount)) {
-                    continue;
-                }
-                
-                // Check decimal places in string representation
-                const usdStr = usdAmount.toString();
-                const tokenStr = tokenAmount.toString();
-                const usdDecimalPlaces = usdStr.includes('.') ? (usdStr.split('.')[1]?.length || 0) : 0;
-                const tokenDecimalPlaces = tokenStr.includes('.') ? (tokenStr.split('.')[1]?.length || 0) : 0;
-                
-                if (usdDecimalPlaces > 4 || tokenDecimalPlaces > 2) {
-                    continue;
-                }
-                
-                return {
-                    usdAmount,
-                    tokenAmount,
-                    usdScaled: U,
-                    tokenScaled: T
-                };
-            }
+    // We'll search a reasonable number of iterations (up to 10000, which is 1 USD in scaled units)
+    for (let i = 0; i < 10000 && U > 0; i++) {
+        // Calculate token scaled amount T = U / price
+        // Using integer arithmetic: T = Math.round(U * SCALE / priceScaled)
+        const T = Math.round(U * SCALE / priceScaled);
+        
+        // Check token constraint
+        if (T % 10000 !== 0) {
+            U -= 100;
+            continue;
         }
         
-        // Try next candidate (reduce by 100, which is 0.0001 USD in scaled units)
-        U -= 100;
+        // Both amounts must be positive
+        if (U <= 0 || T <= 0) {
+            U -= 100;
+            continue;
+        }
+        
+        // Convert back to human-readable amounts
+        const usdAmount = U / SCALE;
+        const tokenAmount = T / SCALE;
+        
+        // Check decimal places in string representation (sanity check)
+        const usdStr = usdAmount.toString();
+        const tokenStr = tokenAmount.toString();
+        const usdDecimalPlaces = usdStr.includes('.') ? (usdStr.split('.')[1]?.length || 0) : 0;
+        const tokenDecimalPlaces = tokenStr.includes('.') ? (tokenStr.split('.')[1]?.length || 0) : 0;
+        
+        if (usdDecimalPlaces > 4 || tokenDecimalPlaces > 2) {
+            U -= 100;
+            continue;
+        }
+        
+        // Verify mathematical consistency (usdAmount * price ≈ tokenAmount)
+        // Calculate with high precision
+        const expectedTokenAmount = usdAmount * price;
+        const tolerance = 0.00001; // Very small tolerance
+        if (Math.abs(tokenAmount - expectedTokenAmount) > tolerance) {
+            U -= 100;
+            continue;
+        }
+        
+        // All constraints satisfied!
+        return {
+            usdAmount,
+            tokenAmount,
+            usdScaled: U,
+            tokenScaled: T
+        };
     }
     
     // No valid amount found
@@ -275,12 +274,20 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
         
         // Verify scaled amounts satisfy constraints
         if (usdScaled % 100 !== 0) {
-            console.error("Cannot buy up token: USD scaled amount last 2 digits not zero", { usdAmount, usdScaled, usdScaledLast2: usdScaled % 100 });
+            console.error("Cannot buy up token: USD scaled amount last 2 digits not zero", { 
+                usdAmount, 
+                usdScaled, 
+                usdScaledLast2: usdScaled % 100 
+            });
             return;
         }
         
         if (tokenScaled % 10000 !== 0) {
-            console.error("Cannot buy up token: token scaled amount last 4 digits not zero", { tokenAmount, tokenScaled, tokenScaledLast4: tokenScaled % 10000 });
+            console.error("Cannot buy up token: token scaled amount last 4 digits not zero", { 
+                tokenAmount, 
+                tokenScaled, 
+                tokenScaledLast4: tokenScaled % 10000 
+            });
             return;
         }
 
@@ -379,46 +386,24 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             return;
         }
 
-        // SIMPLE SOLUTION: Ensure both amounts satisfy API constraints
-        // For BUY orders:
-        // - USD amount (maker) must have ≤ 4 decimal places
-        // - Token amount (taker) must have ≤ 2 decimal places
-        // - Amounts are scaled by 1e6 in API
-        
-        // Start with maximum token amount we can afford (tokens = USD / price)
-        let tokenAmount = tradeAmount / price;
-        
-        // Round DOWN token amount to 2 decimal places (max allowed for taker)
-        // Use roundDown to ensure we don't exceed funds
-        tokenAmount = Math.floor(tokenAmount * 100) / 100;
-        
-        // Calculate USD amount needed for this token amount
-        let usdAmount = tokenAmount * price;
-        
-        // Round USD amount to 4 decimal places (max allowed for maker)
-        usdAmount = parseFloat(usdAmount.toFixed(4));
-        
-        // Verify we have enough funds (should be true due to rounding down)
-        if (usdAmount > tradeAmount) {
-            // If rounding caused issues, reduce token amount by 0.01
-            tokenAmount = parseFloat((tokenAmount - 0.01).toFixed(2));
-            if (tokenAmount <= 0) {
-                console.error("Cannot buy down token: insufficient funds after decimal adjustment");
-                return;
-            }
-            usdAmount = tokenAmount * price;
-            usdAmount = parseFloat(usdAmount.toFixed(4));
-        }
-        
-        // Final validation
-        if (usdAmount <= 0 || tokenAmount <= 0 || 
-            isNaN(usdAmount) || isNaN(tokenAmount) || 
-            !isFinite(usdAmount) || !isFinite(tokenAmount)) {
-            console.error("Cannot buy down token: invalid amounts after decimal adjustment");
+        // Use the same mathematical solution as buyUpToken that guarantees ALL API constraints
+        const result = calculateBuyOrderAmounts(tradeAmount, price);
+        if (!result) {
+            console.error("Cannot buy down token: unable to calculate amounts satisfying all API constraints");
             return;
         }
         
-        // Check decimal constraints explicitly
+        const { usdAmount, tokenAmount, usdScaled, tokenScaled } = result;
+        
+        // Additional validation
+        if (usdAmount <= 0 || tokenAmount <= 0 || 
+            isNaN(usdAmount) || isNaN(tokenAmount) || 
+            !isFinite(usdAmount) || !isFinite(tokenAmount)) {
+            console.error("Cannot buy down token: invalid amounts after mathematical calculation");
+            return;
+        }
+        
+        // Verify constraints explicitly
         const usdStr = usdAmount.toString();
         const tokenStr = tokenAmount.toString();
         const usdDecimalPlaces = usdStr.includes('.') ? (usdStr.split('.')[1]?.length || 0) : 0;
@@ -434,19 +419,22 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             return;
         }
         
-        // Check scaled amounts (1e6)
-        const SCALE = 1e6;
-        const usdScaled = usdAmount * SCALE;
-        const tokenScaled = tokenAmount * SCALE;
-        
-        // Scaled amounts must be integers (or very close due to floating point)
-        if (Math.abs(usdScaled - Math.round(usdScaled)) > 0.0001) {
-            console.error("Cannot buy down token: USD scaled amount is not integer", { usdAmount, usdScaled });
+        // Verify scaled amounts satisfy constraints
+        if (usdScaled % 100 !== 0) {
+            console.error("Cannot buy down token: USD scaled amount last 2 digits not zero", { 
+                usdAmount, 
+                usdScaled, 
+                usdScaledLast2: usdScaled % 100 
+            });
             return;
         }
         
-        if (Math.abs(tokenScaled - Math.round(tokenScaled)) > 0.0001) {
-            console.error("Cannot buy down token: token scaled amount is not integer", { tokenAmount, tokenScaled });
+        if (tokenScaled % 10000 !== 0) {
+            console.error("Cannot buy down token: token scaled amount last 4 digits not zero", { 
+                tokenAmount, 
+                tokenScaled, 
+                tokenScaledLast4: tokenScaled % 10000 
+            });
             return;
         }
 
@@ -456,8 +444,8 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             usdAmount: usdAmount,
             tokenAmount: tokenAmount,
             originalUsd: tradeAmount,
-            usdScaled: Math.round(usdAmount * SCALE),
-            tokenScaled: Math.round(tokenAmount * SCALE)
+            usdScaled: usdScaled,
+            tokenScaled: tokenScaled
         });
 
         try {
@@ -506,10 +494,10 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
                     price: price,
                     usdDecimals: usdAmount.toString().split('.')[1]?.length || 0,
                     tokenDecimals: tokenAmount.toString().split('.')[1]?.length || 0,
-                    usdScaled: Math.round(usdAmount * SCALE),
-                    tokenScaled: Math.round(tokenAmount * SCALE),
-                    usdScaledLast2: Math.round(usdAmount * SCALE) % 100,
-                    tokenScaledLast4: Math.round(tokenAmount * SCALE) % 10000
+                    usdScaled: usdScaled,
+                    tokenScaled: tokenScaled,
+                    usdScaledLast2: usdScaled % 100,
+                    tokenScaledLast4: tokenScaled % 10000
                 });
             }
         } finally {
