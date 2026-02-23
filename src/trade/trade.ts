@@ -150,7 +150,7 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
                         amount: roundedTradeAmount, // USD amount to buy (rounded to 2 decimals)
                         price: price, // Optional: specify price, otherwise uses market price
                         side: Side.BUY,
-                    }, undefined, OrderType.FAK); // FAK allows partial fills, FOK requires full fill
+                    }, undefined, OrderType.GTC); // GTC stays in book until filled or cancelled
 
                     if (!result.success) {
                         throw new Error("❌ Error buying up token: " + result.error);
@@ -231,7 +231,7 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
                         amount: roundedTradeAmount, // USD amount to buy (rounded to 2 decimals)
                         price: price, // Optional: specify price, otherwise uses market price
                         side: Side.BUY,
-                    }, undefined, OrderType.FAK); // FAK allows partial fills, FOK requires full fill
+                    }, undefined, OrderType.GTC); // GTC stays in book until filled or cancelled
 
                     if (!result.success) {
                         throw new Error("❌ Error buying down token: " + result.error);
@@ -328,7 +328,7 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
                         tokenID: this.upTokenId,
                         amount: size,
                         side: Side.SELL,
-                    }, undefined, OrderType.FAK); // FAK allows partial fills, FOK requires full fill
+                    }, undefined, OrderType.GTC); // GTC stays in book until filled or cancelled
 
                     if (!result.success) {
                         throw new Error("❌ Error selling up token: " + result.error);

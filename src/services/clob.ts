@@ -10,7 +10,7 @@ export const SIGNER = new Wallet(POLYMARKET_PRIVATE_KEY);
 // SIGNER is the EOA that signs, FUNDER is the proxy wallet that holds funds
 export const FUNDER = PROXY_WALLET_ADDRESS;
 
-export const SIGNATURE_TYPE = 2; // 2 = Gnosis Safe / Proxy wallet (0 = EOA, 1 = EIP-1271, 2 = Gnosis Safe)
+export const SIGNATURE_TYPE = 1; // 1 = EIP-1271 smart contract wallet (0 = EOA, 1 = EIP-1271, 2 = Gnosis Safe)
 
 
 export const getPrices = async (upTokenId: string, downTokenId: string) => {

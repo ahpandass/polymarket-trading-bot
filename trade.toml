@@ -1,10 +1,10 @@
 strategy = "trade_2"
-trade_usd = 5
+trade_usd = 1
 max_retries = 3
 
 [market]
 market_coin = "btc"  # btc / eth / sol / xrp
-market_period = "60" # 15 / 60 / 240 / 1440
+market_period = "15" # 15 / 60 / 240 / 1440
 
 [trade_1]
 entry_price_range = [0.4, 0.6]
@@ -15,7 +15,7 @@ exit_time_ratio = 0.95
 exit_price_ratio = 0.98
 
 [trade_2]
-entry_price_ratio = [0.4, 0.95]
-entry_time_ratio = 0.6
+entry_price_ratio = [0.45, 0.9]
+entry_time_ratio = 0.65
 exit_price_ratio_range = [[0.0, 0.01], [1.0, 1.0]]
-emergency_swap_price = [0.0, 0.5]
+emergency_swap_price = [0.0, 0.2]
