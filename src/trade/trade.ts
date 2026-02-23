@@ -413,15 +413,18 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             
             const maxRetries = globalThis.__CONFIG__?.max_retries || 3;
             
-        // For BUY orders, amount should be in USD, not token size
+            // For BUY orders, amount should be in USD, not token size
+            // Keep GTC to ensure order tries to get filled (user preference)
             const order = await retryWithInstantRetry(
                 async () => {
-                    console.log("📤 Sending order with amounts:", {
+                    console.log("📤 Sending BUY order with amounts:", {
                         usdAmount,
                         tokenAmount,
                         usdScaled,
                         tokenScaled,
-                        price
+                        price,
+                        orderType: "GTC (Good Till Cancelled)",
+                        strategy: "Stay in order book to maximize fill chance"
                     });
                     
                     const result = await this.authorizedClob.createAndPostMarketOrder({
@@ -429,7 +432,7 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
                         amount: usdAmount, // USD amount to buy
                         price: price, // Optional: specify price, otherwise uses market price
                         side: Side.BUY,
-                    }, undefined, OrderType.GTC); // GTC stays in book until filled or cancelled
+                    }, undefined, OrderType.GTC); // GTC: stay in book to maximize fill chance
 
                     if (!result.success) {
                         throw new Error("❌ Error buying up token: " + result.error);
@@ -722,12 +725,12 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
                         }
                     });
                     
+                    const result = await this.authorizedClob.createAndPostMarketOrder({
+                        tokenID: this.upTokenId,
                         amount: size, // Raw wei amount
                         price: validatedPrice, // Provide price to help calculate market price
                         side: Side.SELL,
-                    }, undefined, OrderTPrice, // ypovede pri.e to help calculate market price
-                        side: Side.SELL,
-                    }, undefined, OrderType.FAK); // FAK allows partial fills, FOK requirFs full fillAK); // FAK allows partial fills, FOK requires full fill
+                    }, undefined, OrderType.FAK); // FAK allows partial fills, FOK requires full fill
 
                     if (!result.success) {
                         throw new Error("❌ Error selling up token: " + result.error);
