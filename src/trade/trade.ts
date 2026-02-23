@@ -676,13 +676,27 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             return false;
         }
 
+        // Additional price validation: price should be between 0.01 and 0.99 for up tokens
+        // If price is too extreme, library may fail to calculate market price
+        const validatedPrice = Math.max(0.01, Math.min(0.99, price));
+        if (Math.abs(validatedPrice - price) > 0.001) {
+            console.warn(`⚠️  Price adjusted from ${price} to ${validatedPrice} to avoid extreme values`);
+        }
+
         console.log("selling up token", { 
             tokenID: this.upTokenId, 
-            price: price, 
+            price: validatedPrice, 
+            originalPrice: price,
             size, 
-            actualBalance, 
+            sizeHuman: actualBalance,
             rawBalance: upBalance.balance,
-            share: this.share 
+            share: this.share,
+            amountFormat: {
+                rawWei: size,
+                humanTokens: actualBalance,
+                price: validatedPrice,
+                expectedUsd: actualBalance * validatedPrice
+            }
         });
         try {
             GLOBAL_TX_PROCESS.current = TxProcess.Working;
@@ -690,13 +704,30 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             const maxRetries = globalThis.__CONFIG__?.max_retries || 3;
             
             // Use FAK (Fill and Kill) instead of FOK to allow partial fills
+            // Provide price parameter to help library calculate market price
             const order = await retryWithInstantRetry(
                 async () => {
-                    const result = await this.authorizedClob.createAndPostMarketOrder({
+                    console.log("📤 Sending sell order with detailed info:", {
                         tokenID: this.upTokenId,
-                        amount: size,
+                        sizeRaw: size,
+                        sizeHuman: actualBalance,
+                        price: validatedPrice,
+                        side: "SELL",
+                        orderType: "FAK",
+                        amountValidation: {
+                            isInteger: Number.isInteger(size),
+                            isFinite: isFinite(size),
+                            isPositive: size > 0,
+                            toString: size.toString()
+                        }
+                    });
+                    
+                        amount: size, // Raw wei amount
+                        price: validatedPrice, // Provide price to help calculate market price
                         side: Side.SELL,
-                    }, undefined, OrderType.GTC); // GTC stays in book until filled or cancelled
+                    }, undefined, OrderTPrice, // ypovede pri.e to help calculate market price
+                        side: Side.SELL,
+                    }, undefined, OrderType.FAK); // FAK allows partial fills, FOK requirFs full fillAK); // FAK allows partial fills, FOK requires full fill
 
                     if (!result.success) {
                         throw new Error("❌ Error selling up token: " + result.error);
@@ -725,9 +756,36 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             return true;
         } catch (error: any) {
             console.error("❌ Error selling up token:", error);
+            
+            // Detailed error analysis
+            if (error?.message?.includes("no match")) {
+                console.error("💡 'no match' error analysis:");
+                console.error("   - This usually means the library couldn't calculate a market price");
+                console.error("   - Possible causes:");
+                console.error("     1. Price parameter may be invalid or too extreme");
+                console.error("     2. Order book may have insufficient liquidity");
+                console.error("     3. Amount format may be incorrect");
+                console.error("   - Attempted parameters:", {
+                    tokenID: this.upTokenId,
+                    amount: size,
+                    amountHuman: actualBalance,
+                    price: validatedPrice,
+                    side: "SELL"
+                });
+            }
+            
             if (error?.status === 401 || error?.data?.error?.includes("Unauthorized")) {
                 console.error("⚠️  API authentication failed. Please check your API_KEY, SECRET_KEY, and PASSPHASE in your .env file.");
             }
+            
+            // Log raw error details for debugging
+            console.error("Raw error details:", {
+                error,
+                status: error?.status,
+                data: error?.data,
+                message: error?.message
+            });
+            
             return false;
         } finally {
             GLOBAL_TX_PROCESS.current = TxProcess.Idle;
@@ -782,13 +840,27 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             return false;
         }
 
+        // Additional price validation: price should be between 0.01 and 0.99 for down tokens
+        // If price is too extreme, library may fail to calculate market price
+        const validatedPrice = Math.max(0.01, Math.min(0.99, price));
+        if (Math.abs(validatedPrice - price) > 0.001) {
+            console.warn(`⚠️  Price adjusted from ${price} to ${validatedPrice} to avoid extreme values`);
+        }
+
         console.log("selling down token", { 
             tokenID: this.downTokenId, 
-            price: price, 
+            price: validatedPrice, 
+            originalPrice: price,
             size, 
-            actualBalance, 
+            sizeHuman: actualBalance,
             rawBalance: downBalance.balance,
-            share: this.share 
+            share: this.share,
+            amountFormat: {
+                rawWei: size,
+                humanTokens: actualBalance,
+                price: validatedPrice,
+                expectedUsd: actualBalance * validatedPrice
+            }
         });
         try {
             GLOBAL_TX_PROCESS.current = TxProcess.Working;
@@ -796,11 +868,30 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             const maxRetries = globalThis.__CONFIG__?.max_retries || 3;
             
             // Use FAK (Fill and Kill) instead of FOK to allow partial fills
+            // Provide price parameter to help library calculate market price
             const order = await retryWithInstantRetry(
                 async () => {
+                    console.log("📤 Sending sell order with detailed info:", {
+                        tokenID: this.downTokenId,
+                        sizeRaw: size,
+                        sizeHuman: actualBalance,
+                        price: validatedPrice,
+                        side: "SELL",
+                        orderType: "FAK",
+                        amountValidation: {
+                            isInteger: Number.isInteger(size),
+                            isFinite: isFinite(size),
+                            isPositive: size > 0,
+                            toString: size.toString()
+                        }
+                    });
+                    
+                    // Try with different amount formats if needed
+                    // First try: raw wei amount (as we've been doing)
                     const result = await this.authorizedClob.createAndPostMarketOrder({
                         tokenID: this.downTokenId,
-                        amount: size,
+                        amount: size, // Raw wei amount
+                        price: validatedPrice, // Provide price to help calculate market price
                         side: Side.SELL,
                     }, undefined, OrderType.FAK); // FAK allows partial fills, FOK requires full fill
 
@@ -831,9 +922,36 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             return true;
         } catch (error: any) {
             console.error("❌ Error selling down token:", error);
+            
+            // Detailed error analysis
+            if (error?.message?.includes("no match")) {
+                console.error("💡 'no match' error analysis:");
+                console.error("   - This usually means the library couldn't calculate a market price");
+                console.error("   - Possible causes:");
+                console.error("     1. Price parameter may be invalid or too extreme");
+                console.error("     2. Order book may have insufficient liquidity");
+                console.error("     3. Amount format may be incorrect");
+                console.error("   - Attempted parameters:", {
+                    tokenID: this.downTokenId,
+                    amount: size,
+                    amountHuman: actualBalance,
+                    price: validatedPrice,
+                    side: "SELL"
+                });
+            }
+            
             if (error?.status === 401 || error?.data?.error?.includes("Unauthorized")) {
                 console.error("⚠️  API authentication failed. Please check your API_KEY, SECRET_KEY, and PASSPHASE in your .env file.");
             }
+            
+            // Log raw error details for debugging
+            console.error("Raw error details:", {
+                error,
+                status: error?.status,
+                data: error?.data,
+                message: error?.message
+            });
+            
             return false;
         } finally {
             GLOBAL_TX_PROCESS.current = TxProcess.Idle;
