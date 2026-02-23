@@ -49,6 +49,52 @@ function roundNormal(num: number, decimals: number): number {
 }
 
 /**
+ * Get optimal sell strategy based on price ratio and situation.
+ * Only sell in emergency situations (low price ratio), otherwise wait for claim.
+ * Returns null if should wait for claim instead of selling.
+ */
+function getSellStrategy(priceRatio: number, isEmergency: boolean = false): {
+    orderType: OrderType;
+    priceMultiplier: number;
+    description: string;
+} | null {
+    // Only sell in emergency situations (price ratio <= 0.2)
+    // For high price ratios (>= 0.9), wait for claim to avoid fees
+    if (isEmergency) {
+        // Emergency swaps: we need guaranteed execution
+        return {
+            orderType: OrderType.FOK, // Fill or Kill - guaranteed full execution
+            priceMultiplier: 0.95, // 5% discount for emergency sale
+            description: "EMERGENCY: FOK with 5% discount to guarantee fill"
+        };
+    }
+    
+    // Check if price ratio is too high (should wait for claim)
+    if (priceRatio >= 0.9) {
+        // Price ratio too high, wait for claim to avoid fees
+        return null; // Null indicates should wait for claim
+    }
+    
+    // Only sell in normal situations when price ratio is reasonable
+    // Normal price ratio: standard FAK
+    return {
+        orderType: OrderType.FAK, // Fill and Kill
+        priceMultiplier: 1.0, // No discount
+        description: "NORMAL: Standard FAK (only for reasonable price ratios)"
+    };
+}
+
+/**
+ * Adjust price based on strategy and ensure it's within valid range.
+ */
+function getAdjustedPrice(originalPrice: number, strategy: { priceMultiplier: number }): number {
+    const adjusted = originalPrice * strategy.priceMultiplier;
+    // Ensure price is between 0.01 and 0.99
+    const clamped = Math.max(0.01, Math.min(0.99, adjusted));
+    return parseFloat(clamped.toFixed(6)); // Keep precision for calculations
+}
+
+/**
  * Calculate BUY order amounts that guarantee API constraints AFTER library processing.
  * The library's behavior appears to be:
  * 1. Round USD amount to 2 decimal places
@@ -679,17 +725,41 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             return false;
         }
 
-        // Additional price validation: price should be between 0.01 and 0.99 for up tokens
-        // If price is too extreme, library may fail to calculate market price
-        const validatedPrice = Math.max(0.01, Math.min(0.99, price));
-        if (Math.abs(validatedPrice - price) > 0.001) {
-            console.warn(`⚠️  Price adjusted from ${price} to ${validatedPrice} to avoid extreme values`);
+        // Calculate price ratio (same as in decision.ts: Math.abs(price - 0.5) / 0.5)
+        // For up token, price is already the probability of up outcome
+        const priceRatio = Math.abs(price - 0.5) / 0.5;
+        
+        // Check if this is an emergency swap (we need to detect from context)
+        // For now, we'll use a simple heuristic: if price ratio is very low (<0.2) or very high (>0.98)
+        const isEmergency = priceRatio <= 0.2 || priceRatio >= 0.98;
+        
+        // Get optimal sell strategy based on price ratio and situation
+        const strategy = getSellStrategy(priceRatio, isEmergency);
+        
+        // If strategy is null, we should wait for claim instead of selling
+        if (strategy === null) {
+            console.log("📊 Price ratio too high (>= 0.9), waiting for claim to avoid fees:", {
+                tokenID: this.upTokenId,
+                price: price,
+                priceRatio: priceRatio.toFixed(4),
+                actualBalance: actualBalance,
+                share: this.share,
+                expectedValue: `$${actualBalance} (if token wins)`,
+                note: "Will wait for market resolution and claim winnings to avoid selling fees"
+            });
+            return false; // Don't sell, wait for claim
         }
-
+        
+        // Get adjusted price based on strategy
+        const adjustedPrice = getAdjustedPrice(price, strategy);
+        
         console.log("selling up token", { 
             tokenID: this.upTokenId, 
-            price: validatedPrice, 
             originalPrice: price,
+            priceRatio: priceRatio.toFixed(4),
+            strategy: strategy.description,
+            adjustedPrice: adjustedPrice,
+            priceAdjustment: `${((adjustedPrice - price) / price * 100).toFixed(2)}%`,
             size, 
             sizeHuman: actualBalance,
             rawBalance: upBalance.balance,
@@ -697,40 +767,44 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             amountFormat: {
                 rawWei: size,
                 humanTokens: actualBalance,
-                price: validatedPrice,
-                expectedUsd: actualBalance * validatedPrice
-            }
+                price: adjustedPrice,
+                expectedUsd: actualBalance * adjustedPrice
+            },
+            isEmergency: isEmergency
         });
         try {
             GLOBAL_TX_PROCESS.current = TxProcess.Working;
             
             const maxRetries = globalThis.__CONFIG__?.max_retries || 3;
             
-            // Use FAK (Fill and Kill) instead of FOK to allow partial fills
-            // Provide price parameter to help library calculate market price
+            // Use optimal strategy based on price ratio and situation
             const order = await retryWithInstantRetry(
                 async () => {
-                    console.log("📤 Sending sell order with detailed info:", {
+                    console.log("📤 Sending sell order with optimized strategy:", {
                         tokenID: this.upTokenId,
                         sizeRaw: size,
                         sizeHuman: actualBalance,
-                        price: validatedPrice,
+                        originalPrice: price,
+                        adjustedPrice: adjustedPrice,
+                        priceRatio: priceRatio.toFixed(4),
                         side: "SELL",
-                        orderType: "FAK",
+                        orderType: OrderType[strategy.orderType],
+                        strategy: strategy.description,
                         amountValidation: {
                             isInteger: Number.isInteger(size),
                             isFinite: isFinite(size),
                             isPositive: size > 0,
                             toString: size.toString()
-                        }
+                        },
+                        notes: "Using price adjustment to ensure fill, especially near 1.0 ratio"
                     });
                     
                     const result = await this.authorizedClob.createAndPostMarketOrder({
                         tokenID: this.upTokenId,
                         amount: size, // Raw wei amount
-                        price: validatedPrice, // Provide price to help calculate market price
+                        price: adjustedPrice, // Use adjusted price based on strategy
                         side: Side.SELL,
-                    }, undefined, OrderType.FAK); // FAK allows partial fills, FOK requires full fill
+                    }, undefined, strategy.orderType); // Use optimal order type from strategy
 
                     if (!result.success) {
                         throw new Error("❌ Error selling up token: " + result.error);
@@ -772,7 +846,10 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
                     tokenID: this.upTokenId,
                     amount: size,
                     amountHuman: actualBalance,
-                    price: validatedPrice,
+                    price: adjustedPrice,
+                    originalPrice: price,
+                    priceRatio: priceRatio.toFixed(4),
+                    strategy: strategy.description,
                     side: "SELL"
                 });
             }
@@ -843,17 +920,41 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             return false;
         }
 
-        // Additional price validation: price should be between 0.01 and 0.99 for down tokens
-        // If price is too extreme, library may fail to calculate market price
-        const validatedPrice = Math.max(0.01, Math.min(0.99, price));
-        if (Math.abs(validatedPrice - price) > 0.001) {
-            console.warn(`⚠️  Price adjusted from ${price} to ${validatedPrice} to avoid extreme values`);
+        // Calculate price ratio (same as in decision.ts: Math.abs(price - 0.5) / 0.5)
+        // For down token, price is already the probability of down outcome
+        const priceRatio = Math.abs(price - 0.5) / 0.5;
+        
+        // Check if this is an emergency swap (we need to detect from context)
+        // For now, we'll use a simple heuristic: if price ratio is very low (<0.2) or very high (>0.98)
+        const isEmergency = priceRatio <= 0.2 || priceRatio >= 0.98;
+        
+        // Get optimal sell strategy based on price ratio and situation
+        const strategy = getSellStrategy(priceRatio, isEmergency);
+        
+        // If strategy is null, we should wait for claim instead of selling
+        if (strategy === null) {
+            console.log("📊 Price ratio too high (>= 0.9), waiting for claim to avoid fees:", {
+                tokenID: this.downTokenId,
+                price: price,
+                priceRatio: priceRatio.toFixed(4),
+                actualBalance: actualBalance,
+                share: this.share,
+                expectedValue: `$${actualBalance} (if token wins)`,
+                note: "Will wait for market resolution and claim winnings to avoid selling fees"
+            });
+            return false; // Don't sell, wait for claim
         }
-
+        
+        // Get adjusted price based on strategy
+        const adjustedPrice = getAdjustedPrice(price, strategy);
+        
         console.log("selling down token", { 
             tokenID: this.downTokenId, 
-            price: validatedPrice, 
             originalPrice: price,
+            priceRatio: priceRatio.toFixed(4),
+            strategy: strategy.description,
+            adjustedPrice: adjustedPrice,
+            priceAdjustment: `${((adjustedPrice - price) / price * 100).toFixed(2)}%`,
             size, 
             sizeHuman: actualBalance,
             rawBalance: downBalance.balance,
@@ -861,9 +962,10 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             amountFormat: {
                 rawWei: size,
                 humanTokens: actualBalance,
-                price: validatedPrice,
-                expectedUsd: actualBalance * validatedPrice
-            }
+                price: adjustedPrice,
+                expectedUsd: actualBalance * adjustedPrice
+            },
+            isEmergency: isEmergency
         });
         try {
             GLOBAL_TX_PROCESS.current = TxProcess.Working;
@@ -874,29 +976,31 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
             // Provide price parameter to help library calculate market price
             const order = await retryWithInstantRetry(
                 async () => {
-                    console.log("📤 Sending sell order with detailed info:", {
+                    console.log("📤 Sending sell order with optimized strategy:", {
                         tokenID: this.downTokenId,
                         sizeRaw: size,
                         sizeHuman: actualBalance,
-                        price: validatedPrice,
+                        originalPrice: price,
+                        adjustedPrice: adjustedPrice,
+                        priceRatio: priceRatio.toFixed(4),
                         side: "SELL",
-                        orderType: "FAK",
+                        orderType: OrderType[strategy.orderType],
+                        strategy: strategy.description,
                         amountValidation: {
                             isInteger: Number.isInteger(size),
                             isFinite: isFinite(size),
                             isPositive: size > 0,
                             toString: size.toString()
-                        }
+                        },
+                        notes: "Using price adjustment to ensure fill, especially near 1.0 ratio"
                     });
                     
-                    // Try with different amount formats if needed
-                    // First try: raw wei amount (as we've been doing)
                     const result = await this.authorizedClob.createAndPostMarketOrder({
                         tokenID: this.downTokenId,
                         amount: size, // Raw wei amount
-                        price: validatedPrice, // Provide price to help calculate market price
+                        price: adjustedPrice, // Use adjusted price based on strategy
                         side: Side.SELL,
-                    }, undefined, OrderType.FAK); // FAK allows partial fills, FOK requires full fill
+                    }, undefined, strategy.orderType); // Use optimal order type from strategy
 
                     if (!result.success) {
                         throw new Error("❌ Error selling down token: " + result.error);
@@ -938,7 +1042,10 @@ export function attachTradeMethods(TradeClass: new (...args: any[]) => any) {
                     tokenID: this.downTokenId,
                     amount: size,
                     amountHuman: actualBalance,
-                    price: validatedPrice,
+                    price: adjustedPrice,
+                    originalPrice: price,
+                    priceRatio: priceRatio.toFixed(4),
+                    strategy: strategy.description,
                     side: "SELL"
                 });
             }
